@@ -1,0 +1,113 @@
+name: Claude OAuth Token Check
+
+on:
+  schedule:
+    # 毎日午前9時（UTC）にチェック実行 (日本時間18時)
+    - cron: '0 9 * * *'
+  workflow_dispatch: # 手動実行も可能
+
+jobs:
+  check-token:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install dependencies
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        
+    - name: Check token expiry
+      id: check
+      run: |
+        # トークンの有効期限をチェック
+        EXPIRES_AT="${{ secrets.CLAUDE_EXPIRES_AT }}"
+        CURRENT_TIME=$(date +%s)
+        
+        # 24時間後のタイムスタンプ（86400秒 = 24時間）
+        WARNING_TIME=$((CURRENT_TIME + 86400))
+        
+        echo "Current time: $CURRENT_TIME"
+        echo "Expires at: $EXPIRES_AT"
+        echo "Warning threshold: $WARNING_TIME"
+        
+        if [ "$EXPIRES_AT" -lt "$WARNING_TIME" ]; then
+          echo "needs_refresh=true" >> $GITHUB_OUTPUT
+          echo "Token will expire within 24 hours!"
+        else
+          echo "needs_refresh=false" >> $GITHUB_OUTPUT
+          echo "Token is still valid for more than 24 hours"
+        fi
+        
+    - name: Create Issue for Token Refresh
+      if: steps.check.outputs.needs_refresh == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const title = '🔑 Claude OAuth Token Refresh Required';
+          const body = `
+          ## ⚠️ Claude OAuth Token Refresh Required
+          
+          The Claude OAuth token will expire within 24 hours.
+          
+          ### 🔄 How to refresh the token:
+          
+          1. **Run the refresh script locally:**
+             \`\`\`bash
+             wsl bash -c "cd /mnt/c/Project/claude-code-action/claude-code-base-action && source ~/.bashrc && node scripts/refresh-oauth-token.js"
+             \`\`\`
+          
+          2. **Update GitHub Secrets:**
+             - Go to Repository Settings > Secrets and variables > Actions
+             - Update the following secrets with the new values from the script output:
+               - \`CLAUDE_ACCESS_TOKEN\`
+               - \`CLAUDE_REFRESH_TOKEN\`
+               - \`CLAUDE_EXPIRES_AT\`
+          
+          3. **Close this issue** once the secrets have been updated.
+          
+          ### 📅 Current Status:
+          - Current time: ${new Date().toISOString()}
+          - Token expires at: ${new Date(parseInt('${{ secrets.CLAUDE_EXPIRES_AT }}') * 1000).toISOString()}
+          
+          This issue was automatically created by the token check workflow.
+          `;
+          
+          // 既存の同様のissueがあるかチェック
+          const existingIssues = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            labels: 'claude-token-refresh'
+          });
+          
+          if (existingIssues.data.length === 0) {
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['claude-token-refresh', 'automation']
+            });
+            console.log('Created new issue for token refresh');
+          } else {
+            console.log('Token refresh issue already exists');
+          }
+          
+    - name: Send Slack notification (Optional)
+      if: steps.check.outputs.needs_refresh == 'true'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        if [ -n "$SLACK_WEBHOOK_URL" ]; then
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🔑 Claude OAuth Token needs refresh! Check the GitHub issue for instructions."}' \
+          "$SLACK_WEBHOOK_URL"
+        fi 

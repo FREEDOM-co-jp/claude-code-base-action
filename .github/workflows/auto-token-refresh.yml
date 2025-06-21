@@ -1,0 +1,159 @@
+name: Auto Claude OAuth Token Refresh
+
+on:
+  schedule:
+    # 毎日午前6時（UTC）にチェック実行 (日本時間15時)
+    - cron: '0 6 * * *'
+  workflow_dispatch: # 手動実行も可能
+    inputs:
+      force_refresh:
+        description: 'Force token refresh even if not expired'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  auto-refresh-token:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Create temporary credentials file
+      run: |
+        # 一時的な認証情報ファイルを作成
+        mkdir -p ~/.claude
+        cat > ~/.claude/.credentials.json << EOF
+        {
+          "claudeAiOauth": {
+            "accessToken": "${{ secrets.CLAUDE_ACCESS_TOKEN }}",
+            "refreshToken": "${{ secrets.CLAUDE_REFRESH_TOKEN }}",
+            "expiresAt": ${{ secrets.CLAUDE_EXPIRES_AT }}
+          }
+        }
+        EOF
+        
+    - name: Check and refresh token
+      id: refresh
+      run: |
+        cd claude-code-base-action
+        
+        # Node.jsスクリプトを実行してトークンをチェック・更新
+        OUTPUT=$(node scripts/refresh-oauth-token.js 2>&1)
+        echo "$OUTPUT"
+        
+        # 出力から新しいトークン情報を抽出
+        if echo "$OUTPUT" | grep -q "CLAUDE_ACCESS_TOKEN:"; then
+          ACCESS_TOKEN=$(echo "$OUTPUT" | grep "CLAUDE_ACCESS_TOKEN:" | cut -d' ' -f2)
+          REFRESH_TOKEN=$(echo "$OUTPUT" | grep "CLAUDE_REFRESH_TOKEN:" | cut -d' ' -f2)
+          EXPIRES_AT=$(echo "$OUTPUT" | grep "CLAUDE_EXPIRES_AT:" | cut -d' ' -f2)
+          
+          echo "new_access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "new_refresh_token=$REFRESH_TOKEN" >> $GITHUB_OUTPUT
+          echo "new_expires_at=$EXPIRES_AT" >> $GITHUB_OUTPUT
+          echo "token_updated=true" >> $GITHUB_OUTPUT
+        else
+          echo "token_updated=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Update GitHub Secrets
+      if: steps.refresh.outputs.token_updated == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        script: |
+          const sodium = require('tweetsodium');
+          
+          // リポジトリの公開鍵を取得
+          const { data: publicKey } = await github.rest.actions.getRepoPublicKey({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          
+          // シークレットを暗号化する関数
+          function encryptSecret(secret, key) {
+            const messageBytes = Buffer.from(secret);
+            const keyBytes = Buffer.from(key, 'base64');
+            const encryptedBytes = sodium.seal(messageBytes, keyBytes);
+            return Buffer.from(encryptedBytes).toString('base64');
+          }
+          
+          // 新しいトークン情報を取得
+          const newAccessToken = '${{ steps.refresh.outputs.new_access_token }}';
+          const newRefreshToken = '${{ steps.refresh.outputs.new_refresh_token }}';
+          const newExpiresAt = '${{ steps.refresh.outputs.new_expires_at }}';
+          
+          // シークレットを更新
+          const secrets = [
+            { name: 'CLAUDE_ACCESS_TOKEN', value: newAccessToken },
+            { name: 'CLAUDE_REFRESH_TOKEN', value: newRefreshToken },
+            { name: 'CLAUDE_EXPIRES_AT', value: newExpiresAt }
+          ];
+          
+          for (const secret of secrets) {
+            const encryptedValue = encryptSecret(secret.value, publicKey.key);
+            
+            await github.rest.actions.createOrUpdateRepoSecret({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              secret_name: secret.name,
+              encrypted_value: encryptedValue,
+              key_id: publicKey.key_id,
+            });
+            
+            console.log(`Updated secret: ${secret.name}`);
+          }
+          
+    - name: Create success notification
+      if: steps.refresh.outputs.token_updated == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          // 既存のトークン更新issueを閉じる
+          const existingIssues = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            labels: 'claude-token-refresh'
+          });
+          
+          for (const issue of existingIssues.data) {
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              state: 'closed'
+            });
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: '✅ Token has been automatically refreshed and GitHub Secrets have been updated.'
+            });
+          }
+          
+          console.log('Closed existing token refresh issues');
+          
+    - name: Clean up temporary files
+      if: always()
+      run: |
+        rm -rf ~/.claude
+        
+    - name: Send success notification (Optional)
+      if: steps.refresh.outputs.token_updated == 'true'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        if [ -n "$SLACK_WEBHOOK_URL" ]; then
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"✅ Claude OAuth Token has been automatically refreshed and GitHub Secrets updated!"}' \
+          "$SLACK_WEBHOOK_URL"
+        fi 
