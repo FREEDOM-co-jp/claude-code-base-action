@@ -1,159 +1,212 @@
-name: Auto Claude OAuth Token Refresh
+name: Claude OAuth Token Monitor
 
 on:
   schedule:
-    # 毎日午前6時（UTC）にチェック実行 (日本時間15時)
+    # 毎日午前6時（UTC）にトークンの状態をチェック
     - cron: '0 6 * * *'
-  workflow_dispatch: # 手動実行も可能
+    # 毎日午後6時（UTC）にも追加チェック
+    - cron: '0 18 * * *'
+  workflow_dispatch:
     inputs:
-      force_refresh:
-        description: 'Force token refresh even if not expired'
+      force_check:
+        description: 'Force token status check'
         required: false
         default: false
         type: boolean
 
 jobs:
-  auto-refresh-token:
+  monitor-token:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      issues: write
+      actions: write
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+      - name: Checkout repository
+        uses: actions/checkout@v4
         
-    - name: Create temporary credentials file
-      run: |
-        # 一時的な認証情報ファイルを作成
-        mkdir -p ~/.claude
-        cat > ~/.claude/.credentials.json << EOF
-        {
-          "claudeAiOauth": {
-            "accessToken": "${{ secrets.CLAUDE_ACCESS_TOKEN }}",
-            "refreshToken": "${{ secrets.CLAUDE_REFRESH_TOKEN }}",
-            "expiresAt": ${{ secrets.CLAUDE_EXPIRES_AT }}
-          }
-        }
-        EOF
-        
-    - name: Check and refresh token
-      id: refresh
-      run: |
-        cd claude-code-base-action
-        
-        # Node.jsスクリプトを実行してトークンをチェック・更新
-        OUTPUT=$(node scripts/refresh-oauth-token.js 2>&1)
-        echo "$OUTPUT"
-        
-        # 出力から新しいトークン情報を抽出
-        if echo "$OUTPUT" | grep -q "CLAUDE_ACCESS_TOKEN:"; then
-          ACCESS_TOKEN=$(echo "$OUTPUT" | grep "CLAUDE_ACCESS_TOKEN:" | cut -d' ' -f2)
-          REFRESH_TOKEN=$(echo "$OUTPUT" | grep "CLAUDE_REFRESH_TOKEN:" | cut -d' ' -f2)
-          EXPIRES_AT=$(echo "$OUTPUT" | grep "CLAUDE_EXPIRES_AT:" | cut -d' ' -f2)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
           
-          echo "new_access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-          echo "new_refresh_token=$REFRESH_TOKEN" >> $GITHUB_OUTPUT
-          echo "new_expires_at=$EXPIRES_AT" >> $GITHUB_OUTPUT
-          echo "token_updated=true" >> $GITHUB_OUTPUT
-        else
-          echo "token_updated=false" >> $GITHUB_OUTPUT
-        fi
-        
-    - name: Update GitHub Secrets
-      if: steps.refresh.outputs.token_updated == 'true'
-      uses: actions/github-script@v7
-      with:
-        github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-        script: |
-          const sodium = require('tweetsodium');
+      - name: Install dependencies
+        run: |
+          npm install
           
-          // リポジトリの公開鍵を取得
-          const { data: publicKey } = await github.rest.actions.getRepoPublicKey({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-          });
+      - name: Check token status
+        id: check-token
+        run: |
+          node -e "
+          const fs = require('fs');
+          const expiresAt = '${{ secrets.CLAUDE_EXPIRES_AT }}';
+          const forceCheck = '${{ github.event.inputs.force_check }}' === 'true';
+          const now = Date.now();
+          const expiryTime = parseInt(expiresAt);
+          const hoursLeft = Math.floor((expiryTime - now) / (1000 * 60 * 60));
+          const daysLeft = Math.floor(hoursLeft / 24);
           
-          // シークレットを暗号化する関数
-          function encryptSecret(secret, key) {
-            const messageBytes = Buffer.from(secret);
-            const keyBytes = Buffer.from(key, 'base64');
-            const encryptedBytes = sodium.seal(messageBytes, keyBytes);
-            return Buffer.from(encryptedBytes).toString('base64');
+          console.log('=== Claude Token Status Check ===');
+          console.log('Current time:', new Date(now).toISOString());
+          console.log('Token expires at:', new Date(expiryTime).toISOString());
+          console.log('Hours until expiry:', hoursLeft);
+          console.log('Days until expiry:', daysLeft);
+          console.log('Force check:', forceCheck);
+          
+          let alertLevel = 'none';
+          let alertMessage = '';
+          let needsAction = false;
+          
+          if (hoursLeft <= 0) {
+            alertLevel = 'critical';
+            alertMessage = '🚨 CRITICAL: Token has EXPIRED!';
+            needsAction = true;
+          } else if (hoursLeft <= 6) {
+            alertLevel = 'urgent';
+            alertMessage = '⚠️ URGENT: Token expires in ' + hoursLeft + ' hours';
+            needsAction = true;
+          } else if (hoursLeft <= 24) {
+            alertLevel = 'warning';
+            alertMessage = '⚠️ WARNING: Token expires in ' + hoursLeft + ' hours (less than 1 day)';
+            needsAction = true;
+          } else if (daysLeft <= 3) {
+            alertLevel = 'notice';
+            alertMessage = '📢 NOTICE: Token expires in ' + daysLeft + ' days';
+            needsAction = true;
+          } else if (forceCheck) {
+            alertLevel = 'info';
+            alertMessage = 'ℹ️ INFO: Token is healthy, expires in ' + daysLeft + ' days';
+            needsAction = false;
           }
           
-          // 新しいトークン情報を取得
-          const newAccessToken = '${{ steps.refresh.outputs.new_access_token }}';
-          const newRefreshToken = '${{ steps.refresh.outputs.new_refresh_token }}';
-          const newExpiresAt = '${{ steps.refresh.outputs.new_expires_at }}';
+          console.log('Alert level:', alertLevel);
+          console.log('Alert message:', alertMessage);
+          console.log('Needs action:', needsAction);
           
-          // シークレットを更新
-          const secrets = [
-            { name: 'CLAUDE_ACCESS_TOKEN', value: newAccessToken },
-            { name: 'CLAUDE_REFRESH_TOKEN', value: newRefreshToken },
-            { name: 'CLAUDE_EXPIRES_AT', value: newExpiresAt }
-          ];
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'alert_level=' + alertLevel + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'alert_message=' + alertMessage + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'needs_action=' + needsAction + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'hours_left=' + hoursLeft + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'days_left=' + daysLeft + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'expires_at=' + new Date(expiryTime).toISOString() + '\n');
           
-          for (const secret of secrets) {
-            const encryptedValue = encryptSecret(secret.value, publicKey.key);
+          console.log('=== End Token Status Check ===');
+          "
+          
+      - name: Send workflow summary (primary notification)
+        if: steps.check-token.outputs.needs_action == 'true'
+        run: |
+          echo "## 🔑 Claude OAuth Token Renewal Alert (claude-code-base-action)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ **RENEWAL NEEDED SOON**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Token Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Current Status**: ${{ steps.check-token.outputs.alert_message }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Expires At**: ${{ steps.check-token.outputs.expires_at }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time Remaining**: ${{ steps.check-token.outputs.hours_left }} hours (${{ steps.check-token.outputs.days_left }} days)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alert Level**: ${{ steps.check-token.outputs.alert_level }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Required Actions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Login to Claude.ai** in your browser" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Open Developer Tools** (F12)" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Go to Application/Storage tab** → Cookies → claude.ai" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Copy the following values**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - \`sessionKey\` (this is your access token)" >> $GITHUB_STEP_SUMMARY
+          echo "   - \`refresh_token\`" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Update Organization Secrets** (recommended for multiple repositories):" >> $GITHUB_STEP_SUMMARY
+          echo "   - Go to **Organization Settings** → **Secrets and variables** → **Actions**" >> $GITHUB_STEP_SUMMARY
+          echo "   - Update **Organization secrets**:" >> $GITHUB_STEP_SUMMARY
+          echo "     - \`CLAUDE_ACCESS_TOKEN\` with the sessionKey value" >> $GITHUB_STEP_SUMMARY
+          echo "     - \`CLAUDE_REFRESH_TOKEN\` with the refresh_token value" >> $GITHUB_STEP_SUMMARY
+          echo "     - \`CLAUDE_EXPIRES_AT\` with new expiration timestamp" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Automation Status" >> $GITHUB_STEP_SUMMARY
+          echo "- ❌ Automatic refresh: **DISABLED** (Cloudflare blocking)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Monitoring: **ACTIVE**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Notifications: **ACTIVE**" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 Using workflow summary for notifications" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Repository Type" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔧 **claude-code-base-action**: Programmatic execution within workflows" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔗 **Related**: claude-code-action (Interactive PR/Issue assistant)" >> $GITHUB_STEP_SUMMARY
             
-            await github.rest.actions.createOrUpdateRepoSecret({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              secret_name: secret.name,
-              encrypted_value: encryptedValue,
-              key_id: publicKey.key_id,
-            });
+      - name: Send Slack notification
+        if: steps.check-token.outputs.needs_action == 'true'
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            ALERT_LEVEL="${{ steps.check-token.outputs.alert_level }}"
+            ALERT_MESSAGE="${{ steps.check-token.outputs.alert_message }}";
+            HOURS_LEFT="${{ steps.check-token.outputs.hours_left }}";
+            EXPIRES_AT="${{ steps.check-token.outputs.expires_at }}";
             
-            console.log(`Updated secret: ${secret.name}`);
-          }
-          
-    - name: Create success notification
-      if: steps.refresh.outputs.token_updated == 'true'
-      uses: actions/github-script@v7
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          // 既存のトークン更新issueを閉じる
-          const existingIssues = await github.rest.issues.listForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            state: 'open',
-            labels: 'claude-token-refresh'
-          });
-          
-          for (const issue of existingIssues.data) {
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              state: 'closed'
-            });
+            # Set color based on alert level
+            case $ALERT_LEVEL in
+              "critical") COLOR="#FF0000" ;;
+              "urgent") COLOR="#FF6600" ;;
+              "warning") COLOR="#FFAA00" ;;
+              "notice") COLOR="#0099FF" ;;
+              *) COLOR="#808080" ;;
+            esac
             
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: '✅ Token has been automatically refreshed and GitHub Secrets have been updated.'
-            });
-          }
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"title\": \"🔑 Claude OAuth Token Renewal Required (claude-code-base-action)\",
+                  \"text\": \"$ALERT_MESSAGE\",
+                  \"fields\": [
+                    {
+                      \"title\": \"Repository\",
+                      \"value\": \"${{ github.repository }}\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"Time Remaining\",
+                      \"value\": \"$HOURS_LEFT hours\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"Expires At\",
+                      \"value\": \"$EXPIRES_AT\",
+                      \"short\": false
+                    },
+                    {
+                      \"title\": \"Action Required\",
+                      \"value\": \"Update Organization Secrets to apply to all 20+ repositories automatically - check GitHub workflow summary for detailed instructions\",
+                      \"short\": false
+                    }
+                  ],
+                  \"footer\": \"Claude Token Monitor (claude-code-base-action)\",
+                  \"ts\": $(date +%s)
+                }]
+              }" \
+              ${{ secrets.SLACK_WEBHOOK_URL }}
+          else
+            echo "SLACK_WEBHOOK_URL not configured, skipping Slack notification"
+          fi
           
-          console.log('Closed existing token refresh issues');
+      - name: Log monitoring results
+        if: always()
+        run: |
+          echo "=== Claude OAuth Token Monitoring Results (claude-code-base-action) ==="
+          echo "Timestamp: $(date -u --iso-8601=seconds)"
+          echo "Alert Level: ${{ steps.check-token.outputs.alert_level }}"
+          echo "Alert Message: ${{ steps.check-token.outputs.alert_message }}"
+          echo "Hours Left: ${{ steps.check-token.outputs.hours_left }}"
+          echo "Days Left: ${{ steps.check-token.outputs.days_left }}"
+          echo "Expires At: ${{ steps.check-token.outputs.expires_at }}"
+          echo "Needs Action: ${{ steps.check-token.outputs.needs_action }}"
+          echo "Repository Type: claude-code-base-action (Programmatic execution)"
+          echo "============================================="
           
-    - name: Clean up temporary files
-      if: always()
-      run: |
-        rm -rf ~/.claude
-        
-    - name: Send success notification (Optional)
-      if: steps.refresh.outputs.token_updated == 'true'
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      run: |
-        if [ -n "$SLACK_WEBHOOK_URL" ]; then
-          curl -X POST -H 'Content-type: application/json' \
-          --data '{"text":"✅ Claude OAuth Token has been automatically refreshed and GitHub Secrets updated!"}' \
-          "$SLACK_WEBHOOK_URL"
-        fi 
+      - name: Update monitoring status
+        if: always()
+        run: |
+          echo "Token monitoring completed successfully"
+          if [ "${{ steps.check-token.outputs.needs_action }}" = "true" ]; then
+            echo "⚠️ Action required: Token renewal needed"
+            exit 0  # Don't fail the workflow, just alert
+          else
+            echo "✅ Token status: OK"
+          fi 
